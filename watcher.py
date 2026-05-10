@@ -102,14 +102,25 @@ def _acquire_pid_lock() -> None:
                 log.info(f"[pid] Found old instance (PID {old_pid}) — stopping it...")
                 try:
                     os.kill(old_pid, signal.SIGTERM)
-                    time.sleep(2)
                 except ProcessLookupError:
-                    pass
-                try:
-                    os.kill(old_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                log.info(f"[pid] Old instance stopped.")
+                    old_pid = None
+                if old_pid:
+                    # Poll until the process is actually gone (up to 5s graceful)
+                    for _ in range(10):
+                        try:
+                            os.kill(old_pid, 0)
+                            time.sleep(0.5)
+                        except ProcessLookupError:
+                            old_pid = None
+                            break
+                    # Force-kill if still alive after graceful window
+                    if old_pid:
+                        try:
+                            os.kill(old_pid, signal.SIGKILL)
+                            time.sleep(1)
+                        except ProcessLookupError:
+                            pass
+                log.info("[pid] Old instance stopped.")
         except (ValueError, OSError):
             pass
 
@@ -1273,15 +1284,8 @@ async def _on_clean_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _show_clean_prompt(query.message.reply_text)
 
 
-async def _do_clean() -> dict:
-    """Wipe all pipeline files and cancel all in-progress jobs. Returns counts."""
-    with _lock:
-        for name in list(_processing):
-            _cancelled.add(name)
-        _processing.clear()
-    _stage.clear()
-    _retry_counts.clear()
-
+def _do_clean_sync() -> dict:
+    """Blocking file deletion — runs in a thread executor from _do_clean()."""
     deleted = {"videos": 0, "frames": 0, "hf": 0, "ws": 0}
 
     for f in glob.glob(os.path.join(RAW_MATERIAL_DIR, "*.mp4")):
@@ -1307,6 +1311,21 @@ async def _do_clean() -> dict:
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
             deleted["ws"] += 1
+
+    return deleted
+
+
+async def _do_clean() -> dict:
+    """Wipe all pipeline files and cancel all in-progress jobs. Returns counts."""
+    with _lock:
+        for name in list(_processing):
+            _cancelled.add(name)
+        _processing.clear()
+    _stage.clear()
+    _retry_counts.clear()
+
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(_executor, _do_clean_sync)
 
     _cancelled.clear()
     return deleted
@@ -1492,6 +1511,9 @@ async def main() -> None:
 
     await _app.initialize()
     await _app.start()
+    # Brief pause so Telegram releases the previous instance's long-poll connection
+    # before we start polling (avoids "Conflict: terminated by other getUpdates" errors)
+    await asyncio.sleep(3)
     await _app.updater.start_polling(drop_pending_updates=True)
     log.info("[bot] Telegram polling started")
 
