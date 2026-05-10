@@ -1,0 +1,210 @@
+# AI Influencer Video Generator
+
+> A fully automated pipeline that takes any TikTok / Instagram / YouTube video, swaps the face with your custom AI character, and delivers a finished video to your Telegram — no manual work after initial setup.
+
+[![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+---
+
+## What This Does
+
+You create an AI character in Higgsfield, and this pipeline handles everything else:
+
+1. **Drop a link or video** — paste a TikTok / Instagram / YouTube URL in Telegram, or upload an .mp4 directly
+2. **Smart frame extraction** — MediaPipe scans every frame to find the single best shot (eyes open, face unobstructed, sharpest detail), then upscales it 2x with EDSR AI super-resolution
+3. **AI character generation** — Higgsfield Nano Banana Pro generates 4 portrait images of your AI character placed in the same scene, pose, and outfit as the original
+4. **You pick one** — the bot sends all 4 to Telegram; you tap a button
+5. **Video generation** — Wavespeed Kling 2.6 Pro Motion Control animates your chosen image using the original video as a motion reference
+6. **Delivery** — finished video is sent to Telegram + uploaded to Google Drive automatically
+
+Everything runs 24/7 as a background process on your computer. You control it entirely from your phone.
+
+---
+
+## How We Built This
+
+### The Problem
+
+Creating AI influencer content manually is brutally repetitive:
+- Download a source video
+- Scrub through to find a clean face frame
+- Upload to Higgsfield, wait 2–3 minutes, download 4 images
+- Manually pick the best one, upload to Wavespeed, wait again
+- Download the result, upload to Google Drive, update a tracking sheet
+
+For a single video this takes 15–20 minutes of active attention. At any real scale it's unsustainable.
+
+### The Solution
+
+We broke the problem into discrete, resumable steps with smart skip logic — if a step already ran, it won't run again. This means the whole pipeline is safe to run multiple times and can resume exactly where it stopped.
+
+---
+
+### Step 1 — Smart Frame Extraction (`extract_frame.py`)
+
+The most underrated part of the pipeline. A bad input frame destroys the output even if everything downstream is perfect.
+
+We use **MediaPipe Face Landmarker** and **Hand Landmarker** together:
+- Sample 120 frames from the middle 90% of the video (skipping fade-in/fade-out)
+- Score each frame on 4 dimensions:
+  - **Eye blink score** (blendshapes: 0 = open, 1 = closed) — we want eyes open
+  - **Sharpness** (Laplacian variance on the face crop) — higher is better
+  - **Hand obstruction** (are any hand landmarks inside the face bounding box?)
+  - **Face visibility** (is a face even detected?)
+- Pick via tiered priority: clean face + eyes open + sharp → clean face + eyes open → clean face + sharpest → fallback
+
+Once the best frame is chosen, we apply **EDSR 2x AI super-resolution** (OpenCV DNN) to sharpen the face before sending to Higgsfield. Falls back to Lanczos upscaling if the model isn't available.
+
+### Step 2 — AI Character Generation (`higgsfield_generate.py`)
+
+We call Higgsfield's Nano Banana Pro model with two reference images:
+- **Image 1**: your AI character reference (the face/identity to transplant)
+- **Image 2**: the extracted scene frame (pose, outfit, lighting, background to replicate)
+
+4 jobs run in parallel via `ThreadPoolExecutor` — 4x faster than sequential. The prompt is deliberately minimal and avoids face-swap language that can trigger content filters.
+
+### Step 3 — Manual Selection (human in the loop)
+
+You review the 4 generated images and pick the best one. In Telegram bot mode this is a single button tap. In CLI mode it's copying your chosen file to `selected.png`.
+
+This is the one intentionally manual step — AI generation quality is still variable enough that a human eye is worth it before spending video generation credits.
+
+### Step 4 — Video Generation (`wavespeed_generate.py`)
+
+We upload the selected image + original video to Wavespeed's API, submit a Kling 2.6 Pro Motion Control job, poll every 5 seconds, and download the result when done. Videos over 10 seconds are automatically trimmed before upload (Kling's hard limit).
+
+### Step 5 — The 24/7 Telegram Bot (`watcher.py`)
+
+A **Watchdog filesystem observer** watches `raw material/` for new .mp4 files — any new file automatically triggers the full pipeline. The Telegram bot layer adds:
+- **URL downloads** (TikTok, Instagram, YouTube via yt-dlp with automatic H.264 re-encoding)
+- **Direct file uploads** via Telegram (up to 20MB)
+- **Frame approval step** with retry option before spending Higgsfield credits
+- **Live progress bar** during image generation (updates as each of 4 jobs finishes)
+- **Image selection buttons** — tap 1, 2, 3, or 4
+- **Delivery** of finished video + Google Drive link
+- `/status`, `/cancel`, `/help` commands
+- **Single-instance enforcement** — safe to run `start_bot.sh` repeatedly
+- **Auto-resume on restart** — picks up mid-pipeline jobs where they left off
+
+---
+
+## Tech Stack
+
+| Tool | Purpose |
+|------|---------|
+| [Higgsfield](https://higgsfield.ai) | AI character image generation (Nano Banana Pro model) |
+| [Wavespeed Kling 2.6 Pro](https://wavespeed.ai) | Motion control video generation |
+| [MediaPipe](https://mediapipe.dev) | Face landmark + blink detection, hand tracking |
+| [OpenCV + EDSR](https://github.com/Saafke/EDSR_Tensorflow) | Frame extraction + 2x AI super-resolution |
+| [python-telegram-bot](https://python-telegram-bot.org) | Async Telegram automation with inline buttons |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | TikTok / Instagram / YouTube download |
+| [Google Drive API](https://developers.google.com/drive) | Auto-upload finished videos |
+| [Google Sheets API](https://developers.google.com/sheets) | Pipeline tracking spreadsheet |
+| [Watchdog](https://github.com/gorakhargosh/watchdog) | Filesystem event watching for auto-trigger |
+| [ffmpeg](https://ffmpeg.org) | Video trimming, frame extraction, codec conversion |
+
+---
+
+## Folder Structure
+
+```
+ai-influencer-automation/
+├── character sheet/           ← Your AI character reference images
+│   └── character-main.png    ← Primary reference (face identity)
+├── raw material/              ← Drop .mp4 files here (or send via Telegram)
+├── extracted frames/          ← Auto-generated best frames
+├── outputs/
+│   ├── higgsfield/            ← 4 generated images per video
+│   └── wavespeed/             ← Final output videos
+│
+├── config.example.py          ← Template — copy to config.py and fill in keys
+├── config.py                  ← Your API keys (git-ignored, never committed)
+├── extract_frame.py           ← Step 1: Smart frame extraction + upscaling
+├── higgsfield_generate.py     ← Step 2: AI character image generation (4 parallel)
+├── wavespeed_generate.py      ← Step 4: Final video generation via Kling
+├── run_pipeline.py            ← One-command full pipeline runner
+├── watcher.py                 ← 24/7 Telegram bot + filesystem daemon
+├── sheets.py                  ← Google Sheets read/write helper
+├── drive_upload.py            ← Google Drive upload helper
+├── setup_sheet.py             ← One-time: creates sheet column headers
+├── setup.sh                   ← First-time setup script (creates folders, installs deps)
+├── start_bot.sh               ← Start the 24/7 daemon in background
+├── stop_bot.sh                ← Stop the daemon
+└── requirements.txt           ← Python dependencies
+```
+
+---
+
+## Quick Start — with Claude Code + VS Code (Recommended)
+
+The easiest way to set everything up is to let Claude guide you:
+
+1. **Clone this repo**
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/ai-influencer-automation.git
+   cd ai-influencer-automation
+   ```
+2. **Open the folder in VS Code**
+3. **Open Claude Code** (the chat panel in the sidebar or bottom)
+4. **Type:** `set up this project for me`
+
+Claude will read the `CLAUDE.md` guide in this repo and walk you through every step interactively — creating folders, installing dependencies, filling in your API keys, and running a test.
+
+> See [INSTALLATION.md](INSTALLATION.md) for the full manual step-by-step (works without VS Code too).
+
+---
+
+## Running the Pipeline
+
+### Option A — Simple CLI (no Telegram bot)
+
+```bash
+# Drop your .mp4 into raw material/, then:
+python3 run_pipeline.py
+
+# It will pause and ask you to pick the best Higgsfield image.
+# Open outputs/higgsfield/{video_name}/ → pick best → save as selected.png → run again:
+python3 run_pipeline.py
+```
+
+### Option B — 24/7 Telegram Bot
+
+```bash
+bash start_bot.sh    # start daemon in background
+bash stop_bot.sh     # stop it
+tail -f watcher.log  # view live logs
+```
+
+Then in Telegram:
+- Paste a TikTok / Instagram / YouTube link — it downloads automatically
+- Or send a video file (up to 20MB)
+- Follow the interactive buttons
+
+---
+
+## API Keys You Need
+
+| Service | Where to get it | Required? |
+|---------|----------------|-----------|
+| **Higgsfield API key** | [higgsfield.ai](https://higgsfield.ai) → Settings → API | Yes |
+| **Higgsfield CLI** | `pip install higgsfield && higgsfield auth login` | Yes |
+| **Wavespeed API key** | [wavespeed.ai](https://wavespeed.ai) → Dashboard → API Keys | Yes |
+| **Telegram Bot Token** | [@BotFather](https://t.me/BotFather) → /newbot | For bot mode |
+| **Google credentials.json** | Google Cloud Console → OAuth2 → Download | For Sheets + Drive |
+
+---
+
+## Notes
+
+- **Model files download automatically** on first run (`face_landmarker.task`, `hand_landmarker.task`, `EDSR_x2.pb`)
+- **Videos over 10 seconds** are auto-trimmed before Wavespeed upload
+- **Higgsfield generates 4 images in parallel** — 4x faster but uses 4 credits per video
+- **Instagram downloads** require cookies if the account is private — send `cookies.txt` to the bot
+- **The pipeline is fully resumable** — run `run_pipeline.py` as many times as you want; done steps are skipped
+
+---
+
+## License
+
+MIT — use it, modify it, build with it.

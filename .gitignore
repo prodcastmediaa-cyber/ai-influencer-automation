@@ -1,0 +1,47 @@
+# ─── Secrets — NEVER commit these ────────────────────────────────────────────
+credentials.json
+token.pickle
+config.py
+cookies.txt
+
+# ─── Character reference images — add your own, don't commit others' ──────────
+character sheet/*.png
+character sheet/*.jpg
+character sheet/*.jpeg
+character sheet/*.webp
+character sheet/*.gif
+
+# ─── Large media — store separately (too large for git) ───────────────────────
+raw material/
+outputs/
+extracted frames/
+
+# ─── Runtime state ────────────────────────────────────────────────────────────
+.watcher.pid
+watcher.log
+
+# ─── Binary model files — downloaded automatically on first run ───────────────
+*.task
+*.pb
+
+# ─── macOS system files ────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+com.*.plist
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
