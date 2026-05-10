@@ -70,6 +70,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Suppress httpx/telegram network logs — they log the full API URL which
+# contains the bot token in plaintext on every request.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 # ── Single-instance lock ──────────────────────────────────────────────────────
 
 _PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".watcher.pid")
@@ -311,7 +317,7 @@ async def _wait_until_stable(path: str) -> bool:
 # ── Sub-pipeline: frame extract (used by retry too) ──────────────────────────
 
 async def _do_frame_extract(name: str) -> None:
-    """Extract frame and show approval prompt. Used on first run and on retry."""
+    """Extract frame then auto-start Higgsfield generation."""
     loop = asyncio.get_running_loop()
     with _lock:
         _processing.add(name)
@@ -329,7 +335,7 @@ async def _do_frame_extract(name: str) -> None:
             _processing.discard(name)
         return
 
-    await _send_frame_approval(name)
+    asyncio.create_task(_do_higgsfield(name))
 
 
 # ── Sub-pipeline: Higgsfield with live progress bar ──────────────────────────
@@ -487,14 +493,14 @@ async def _pipeline(name: str, stable: bool = False) -> None:
                     _processing.discard(name)
                 return
 
-        # Step 2 — show frame for approval before spending Higgsfield credits
+        # Step 2 — auto-start Higgsfield (no frame approval gate)
         if not _has_higgsfield(name):
             if name in _cancelled:
                 with _lock:
                     _processing.discard(name)
                 return
-            await _send_frame_approval(name)
-            return  # pipeline pauses here — continues via frame_approve callback
+            asyncio.create_task(_do_higgsfield(name))
+            return
 
         # Step 3 — (startup resume: Higgsfield images exist but not picked yet)
         if not _has_selected(name):
@@ -878,8 +884,8 @@ async def _on_see_frame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Redo Images", callback_data=f"frame_ok:{name}"),
-        InlineKeyboardButton("▶️ Pick & Continue", callback_data=f"frame_pick:{name}"),
+        InlineKeyboardButton("🔄 Try Different Frame", callback_data=f"frame_retry_full:{name}"),
+        InlineKeyboardButton("✅ Pick 1/2/3/4", callback_data=f"frame_pick:{name}"),
     ]])
     with open(frame_path, "rb") as f:
         await _app.bot.send_photo(
@@ -916,6 +922,33 @@ async def _on_frame_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"✅ *{name}* — Frame confirmed! Choose your image:", parse_mode="Markdown"
     )
     await _send_selection_prompt(name)
+
+
+async def _on_frame_retry_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete frame + all Higgsfield images, re-extract a different frame, regenerate."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    if os.path.exists(frame_path):
+        os.remove(frame_path)
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+
+    _cancelled.discard(name)
+    with _lock:
+        _processing.discard(name)
+
+    try:
+        await query.edit_message_caption(
+            f"🔄 *{name}* — Trying a different frame and regenerating all images...",
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    asyncio.create_task(_do_frame_extract(name))
 
 
 def _build_cancel_keyboard() -> tuple:
@@ -1089,20 +1122,19 @@ async def _on_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Paste a TikTok / Instagram / YouTube link\n"
         "• Or send a video file directly (up to 20 MB)\n\n"
         "*Pipeline steps:*\n"
-        "1️⃣ Frame extracted → you approve or retry\n"
+        "1️⃣ Frame extracted automatically\n"
         "2️⃣ 4 AI images generated with live progress\n"
-        "3️⃣ You pick the best image\n"
+        "3️⃣ You pick the best image (tap 1/2/3/4)\n"
         "4️⃣ Final video → Telegram + Google Drive link\n\n"
         "*Commands:*\n"
         "/status — See all videos and their stage\n"
         "/cancel — Cancel & delete a video from the queue\n"
         "/help — Show this message\n\n"
         "*Buttons:*\n"
-        "✅ Generate Images — approve frame, start AI gen\n"
-        "🔄 New Frame — try a different source frame\n"
         "✅ Pick 1/2/3/4 — choose the best AI image\n"
-        "🔄 Restart Gen — regenerate all 4 images\n"
-        "🖼 See Frame — view the source frame again\n"
+        "🖼 See Frame — view the extracted source frame\n"
+        "🔄 Try Different Frame — re-extract frame & regenerate all 4 images\n"
+        "🔄 Restart Gen — regenerate all 4 images (keep same frame)\n"
         "🔄 Retry — retry after a failure\n"
         "❌ Cancel — stop processing and clean up\n\n"
         f"*Instagram cookies:* {cookies_status}\n"
@@ -1194,8 +1226,8 @@ async def _startup_scan() -> None:
             lines.append(f"• `{name}` — 👆 Needs image pick")
             pending.append(("pick", name))
         elif _has_frame(name):
-            lines.append(f"• `{name}` — ⏸ Needs frame approval")
-            pending.append(("frame", name))
+            lines.append(f"• `{name}` — 🎨 Generating images...")
+            pending.append(("higgsfield_auto", name))
         else:
             lines.append(f"• `{name}` — 📥 Queued for processing")
             pending.append(("pipeline", name))
@@ -1210,10 +1242,10 @@ async def _startup_scan() -> None:
             with _lock:
                 _processing.add(name)
             await _send_selection_prompt(name)
-        elif kind == "frame":
+        elif kind == "higgsfield_auto":
             with _lock:
                 _processing.add(name)
-            await _send_frame_approval(name)
+            asyncio.create_task(_do_higgsfield(name))
         else:
             asyncio.create_task(_pipeline(name, stable=True))
 
@@ -1256,6 +1288,7 @@ async def main() -> None:
     _app.add_handler(CallbackQueryHandler(_on_see_frame,          pattern=r"^see_frame:"))
     _app.add_handler(CallbackQueryHandler(_on_frame_ok,           pattern=r"^frame_ok:"))
     _app.add_handler(CallbackQueryHandler(_on_frame_pick,         pattern=r"^frame_pick:"))
+    _app.add_handler(CallbackQueryHandler(_on_frame_retry_full,   pattern=r"^frame_retry_full:"))
     _app.add_handler(CallbackQueryHandler(_on_action_start,       pattern=r"^action:start$"))
     _app.add_handler(CallbackQueryHandler(_on_retry_url,          pattern=r"^retry_url:"))
 
